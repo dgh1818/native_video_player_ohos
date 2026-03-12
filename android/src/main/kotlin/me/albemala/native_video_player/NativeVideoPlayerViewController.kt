@@ -13,6 +13,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
@@ -27,6 +28,7 @@ class NativeVideoPlayerViewController(
     viewId: Int,
     context: Context,
     private val api: NativeVideoPlayerApi = NativeVideoPlayerApi(messenger, viewId),
+    private val dataSourceFactory: ((Map<String, String>) -> DataSource.Factory)? = null,
 ) : PlatformView,
     NativeVideoPlayerApiDelegate,
     Player.Listener {
@@ -86,7 +88,8 @@ class NativeVideoPlayerViewController(
         when (videoSource.type) {
             VideoSourceType.Asset, VideoSourceType.File -> player.setMediaItem(mediaItem)
             VideoSourceType.Network -> {
-                val dataSource = DefaultHttpDataSource.Factory().setDefaultRequestProperties(videoSource.headers)
+                val dataSource = dataSourceFactory?.invoke(videoSource.headers)
+                    ?: DefaultHttpDataSource.Factory().setDefaultRequestProperties(videoSource.headers)
                 val mediaSource = ProgressiveMediaSource.Factory(dataSource).createMediaSource(mediaItem)
                 player.setMediaSource(mediaSource)
             }
