@@ -3,6 +3,10 @@ import 'package:native_video_player/src/video_info.dart';
 import 'package:native_video_player/src/video_source.dart';
 
 class NativeVideoPlayerApi {
+  static const MethodChannel _pluginChannel = MethodChannel(
+    'me.albemala.native_video_player.plugin',
+  );
+
   final int viewId;
   final void Function() onPlaybackReady;
   final void Function() onPlaybackEnded;
@@ -22,26 +26,47 @@ class NativeVideoPlayerApi {
     _channel.setMethodCallHandler(_handleMethodCall);
   }
 
-  void dispose() {
+  static Future<int> createOhosPlayer() async {
+    final playerId = await _pluginChannel.invokeMethod<int>('create');
+    if (playerId == null) {
+      throw StateError('Failed to create OHOS video player');
+    }
+    return playerId;
+  }
+
+  void detach() {
     _channel.setMethodCallHandler(null);
   }
 
-  Future<dynamic> _handleMethodCall(MethodCall call) {
+  Future<void> disposePlayer() async {
+    try {
+      await _channel.invokeMethod<void>('dispose');
+    } on MissingPluginException {
+      // Platform-specific dispose is only implemented on OHOS.
+    }
+  }
+
+  Future<void> _handleMethodCall(MethodCall call) async {
     switch (call.method) {
       case 'onPlaybackReady':
         onPlaybackReady();
+        return;
       case 'onPlaybackEnded':
         onPlaybackEnded();
+        return;
       case 'onPlaybackPositionChanged':
         final position = call.arguments as int;
         onPlaybackPositionChanged(position);
+        return;
       case 'onError':
         // final errorCode = call.arguments['errorCode'] as int;
         // final errorMessage = call.arguments['errorMessage'] as String;
         final message = call.arguments as String;
         onError(message);
+        return;
+      default:
+        throw UnsupportedError('Unrecognized method ${call.method}');
     }
-    throw UnsupportedError('Unrecognized method ${call.method}');
   }
 
   Future<void> loadVideoSource(VideoSource videoSource) async {
@@ -97,14 +122,14 @@ class NativeVideoPlayerApi {
   }
 
   Future<void> setVolume(double volume) async {
-    await _channel.invokeMethod<bool>(
+    await _channel.invokeMethod<dynamic>(
       'setVolume',
       volume,
     );
   }
 
   Future<void> setPlaybackSpeed(double speed) async {
-    await _channel.invokeMethod<bool>(
+    await _channel.invokeMethod<dynamic>(
       'setPlaybackSpeed',
       speed,
     );
@@ -112,7 +137,7 @@ class NativeVideoPlayerApi {
 
   // ignore: avoid_positional_boolean_parameters
   Future<void> setLoop(bool loop) async {
-    await _channel.invokeMethod<bool>(
+    await _channel.invokeMethod<dynamic>(
       'setLoop',
       loop,
     );

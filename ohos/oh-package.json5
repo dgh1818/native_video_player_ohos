@@ -1,0 +1,11 @@
+{
+  "name": "native_video_player",
+  "version": "1.0.0",
+  "description": "OHOS implementation for native_video_player.",
+  "main": "Index.ets",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@ohos/flutter_ohos": "file:./har/flutter.har"
+  }
+}

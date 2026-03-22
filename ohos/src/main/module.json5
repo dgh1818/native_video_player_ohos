@@ -1,0 +1,11 @@
+{
+  "module": {
+    "name": "native_video_player",
+    "type": "har",
+    "deviceTypes": [
+      "default",
+      "tablet",
+      "2in1"
+    ]
+  }
+}

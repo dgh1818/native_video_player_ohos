@@ -8,6 +8,7 @@ import 'package:native_video_player/src/video_info.dart';
 import 'package:native_video_player/src/video_source.dart';
 
 class NativeVideoPlayerController with ChangeNotifier {
+  final int? textureId;
   late final NativeVideoPlayerApi _api;
   VideoSource? _videoSource;
   VideoInfo? _videoInfo;
@@ -70,7 +71,8 @@ class NativeVideoPlayerController with ChangeNotifier {
   /// NOTE: For internal use only.
   /// See [NativeVideoPlayerView.onViewReady] instead.
   @protected
-  NativeVideoPlayerController(int viewId) {
+  NativeVideoPlayerController(int viewId, {this.textureId}) {
+    debugPrint('NativeVideoPlayerController loadVideoSource id=$viewId');
     _api = NativeVideoPlayerApi(
       viewId: viewId,
       onPlaybackReady: _onPlaybackReady,
@@ -78,6 +80,11 @@ class NativeVideoPlayerController with ChangeNotifier {
       onPlaybackPositionChanged: _onPlaybackPositionChanged,
       onError: _onError,
     );
+  }
+
+  static Future<NativeVideoPlayerController> createOhos() async {
+    final playerId = await NativeVideoPlayerApi.createOhosPlayer();
+    return NativeVideoPlayerController(playerId, textureId: playerId);
   }
 
   Future<void> _onPlaybackReady() async {
@@ -100,7 +107,8 @@ class NativeVideoPlayerController with ChangeNotifier {
   @override
   @protected
   void dispose() {
-    _api.dispose();
+    unawaited(_api.disposePlayer());
+    _api.detach();
     super.dispose();
   }
 
