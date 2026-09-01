@@ -11,6 +11,14 @@ import { VideoInfo } from './VideoInfo';
 const FILE_PREFIX = 'file://';
 const FD_PREFIX = 'fd://';
 const SEEK_DONE_THRESHOLD_MS = 100;
+const CONTINUOUS_SEEK_IDLE_TIMEOUT_MS = 250;
+const NETWORK_PLAYBACK_STRATEGY: media.PlaybackStrategy = {
+  // Keep enough data in memory for a stable progressive stream while the
+  // separate start threshold below allows playback to begin quickly.
+  preferredBufferDuration: 20,
+  preferredBufferDurationForPlaying: 1,
+  showFirstFrameOnPrepare: true,
+};
 const SUPPORTED_PLAYBACK_SPEEDS: Map<number, media.PlaybackSpeed> = new Map<number, media.PlaybackSpeed>([
   [0.75, media.PlaybackSpeed.SPEED_FORWARD_0_75_X],
   [1.0, media.PlaybackSpeed.SPEED_FORWARD_1_00_X],
@@ -44,10 +52,6 @@ function canPause(state: media.AVPlayerState): boolean {
   return state === 'playing';
 }
 
-function hasHeaders(headers: Record<string, string>): boolean {
-  return Object.keys(headers).length > 0;
-}
-
 interface AVPlayerWithPlaybackRate extends media.AVPlayer {
   setPlaybackRate(rate: number): void;
 }
@@ -63,10 +67,14 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
   private loop: boolean = false;
   private isSeeking: boolean = false;
   private pendingSeekPosition: number | null = null;
+  private continuousSeekActive: boolean = false;
+  private continuousSeekTimer: number | null = null;
+  private continuousSeekSupported: boolean | null = null;
   private fileDescriptor: number | null = null;
 
   private onStateChangeHandler?: (state: media.AVPlayerState, reason: media.StateChangeReason) => Promise<void>;
   private onTimeUpdateHandler?: (time: number) => void;
+  private onSeekDoneHandler?: (time: number) => void;
   private onErrorHandler?: (error: BusinessError) => void;
 
   constructor(
@@ -95,21 +103,19 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
 
   async loadVideoSource(videoSource: VideoSource): Promise<void> {
     this.pendingSource = videoSource;
-    this.isSeeking = false;
-    this.pendingSeekPosition = null;
+    this.clearSeekState();
+    this.continuousSeekSupported = null;
     this.lastPosition = -1;
     if (!this.player) {
       return;
     }
     if (this.player.state === 'idle') {
-      this.tryApplyPendingSource();
+      await this.tryApplyPendingSource();
       return;
     }
     try {
-      const resetResult = this.player.reset();
-      this.handleMaybePromise(resetResult, undefined, (error: Error) => {
-        this.api.onError(error);
-      });
+      await this.player.reset();
+      await this.tryApplyPendingSource();
     } catch (e) {
       this.api.onError(e);
     }
@@ -131,8 +137,9 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     if (!player || !canPlay(player.state)) {
       return;
     }
+    this.finishContinuousSeek();
     if (player.state === 'completed') {
-      this.safeRun(() => player.seek(0, media.SeekMode.SEEK_CLOSEST));
+      this.safeRun(() => player.seek(0, media.SeekMode.SEEK_PREV_SYNC));
     }
     this.safeRunVoid(
       () => player.play(),
@@ -142,9 +149,11 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
 
   pause(): void {
     const player = this.player;
-    if (!player || !canPause(player.state)) {
+    if (!player) {
       return;
     }
+    this.finishContinuousSeek();
+    if (!canPause(player.state)) return;
     this.safeRunVoid(
       () => player.pause(),
       (error: Error | string) => this.api.onError(error)
@@ -154,13 +163,13 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
   stop(): void {
     const player = this.player;
     if (!player) return;
-    this.isSeeking = false;
-    this.pendingSeekPosition = null;
+    this.finishContinuousSeek();
+    this.clearSeekState();
     const state = player.state;
     const seekToStart = (): void => {
       const activePlayer = this.player;
       if (activePlayer && canSeek(activePlayer.state)) {
-        this.safeRun(() => activePlayer.seek(0, media.SeekMode.SEEK_CLOSEST));
+        this.safeRun(() => activePlayer.seek(0, media.SeekMode.SEEK_PREV_SYNC));
       }
     };
     if (state === 'playing') {
@@ -183,13 +192,26 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     if (!player || !canSeek(player.state)) return;
     this.isSeeking = true;
     this.pendingSeekPosition = position;
+    if (this.canUseContinuousSeek(player)) {
+      this.continuousSeekActive = true;
+      this.scheduleContinuousSeekFinish();
+      try {
+        player.seek(position, media.SeekMode.SEEK_CONTINUOUS);
+        return;
+      } catch (e) {
+        // Some codecs/devices report support but still reject the operation.
+        // Fall back to the keyframe seek path instead of leaving the player
+        // in a permanently seeking state.
+        this.continuousSeekActive = false;
+        this.cancelContinuousSeekTimer();
+        this.continuousSeekSupported = false;
+      }
+    }
+
     try {
-      player.seek(position, media.SeekMode.SEEK_CLOSEST);
-      this.isSeeking = false;
-      this.pendingSeekPosition = null;
+      player.seek(position, media.SeekMode.SEEK_PREV_SYNC);
     } catch (e) {
-      this.isSeeking = false;
-      this.pendingSeekPosition = null;
+      this.clearSeekState();
       this.api.onError(e);
     }
   }
@@ -295,7 +317,7 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     try {
       this.player = await media.createAVPlayer();
       this.attachListeners();
-      this.tryApplyPendingSource();
+      await this.tryApplyPendingSource();
     } catch (e) {
       this.api.onError(e);
     }
@@ -310,7 +332,7 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
       if (!this.player) return;
       switch (state) {
         case 'idle':
-          this.tryApplyPendingSource();
+          await this.tryApplyPendingSource();
           break;
         case 'initialized':
           if (!this.player) return;
@@ -345,17 +367,10 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     this.player.on(
       'timeUpdate',
       (this.onTimeUpdateHandler = (time: number): void => {
+        // A timeUpdate can describe the old position while a seek is still
+        // pending. Only seekDone is authoritative for the Flutter state.
         if (this.isSeeking) {
-          if (this.pendingSeekPosition != null) {
-            const diff = Math.abs(time - this.pendingSeekPosition);
-            if (diff > SEEK_DONE_THRESHOLD_MS) {
-              return;
-            }
-            this.isSeeking = false;
-            this.pendingSeekPosition = null;
-          } else {
-            return;
-          }
+          return;
         }
         if (this.lastPosition !== time) {
           this.lastPosition = time;
@@ -364,7 +379,36 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
       })
     );
 
+    this.player.on(
+      'seekDone',
+      (this.onSeekDoneHandler = (requestedTime: number): void => {
+      const player = this.player;
+      const pendingPosition = this.pendingSeekPosition;
+      if (!player || this.continuousSeekActive || !this.isSeeking || pendingPosition == null) {
+        return;
+      }
+
+      // A previous seek may complete after a newer slider position was sent.
+      // Re-issue the newest target and wait for its completion notification.
+      if (Math.abs(requestedTime - pendingPosition) > SEEK_DONE_THRESHOLD_MS) {
+        this.safeRun(() => player.seek(pendingPosition, media.SeekMode.SEEK_PREV_SYNC));
+        return;
+      }
+
+      this.isSeeking = false;
+      this.pendingSeekPosition = null;
+      let actualPosition = requestedTime;
+      try {
+        actualPosition = player.currentTime;
+      } catch (e) {
+      }
+      this.lastPosition = actualPosition;
+      this.api.onPlaybackPositionChanged(actualPosition);
+      })
+    );
+
     this.onErrorHandler = (error: BusinessError): void => {
+      this.clearSeekState();
       this.api.onError(error.message);
     };
     this.player.on('error', this.onErrorHandler);
@@ -399,34 +443,33 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     }
   }
 
-  private tryApplyPendingSource(): boolean {
+  private async tryApplyPendingSource(): Promise<boolean> {
     if (!this.player || !this.pendingSource || this.player.state !== 'idle') {
       return false;
     }
     const source = this.pendingSource;
     this.pendingSource = null;
-    this.applyVideoSource(source);
-    return true;
+    try {
+      await this.applyVideoSource(source);
+      return true;
+    } catch (e) {
+      this.api.onError(e);
+      return false;
+    }
   }
 
   private async applyVideoSource(videoSource: VideoSource): Promise<void> {
     if (!this.player) return;
 
     this.closeFileDescriptor();
-    if (videoSource.type === VideoSourceType.Network && hasHeaders(videoSource.headers)) {
+    if (videoSource.type === VideoSourceType.Network) {
       const mediaSource = media.createMediaSourceWithUrl(
         videoSource.path,
         videoSource.headers
       );
-      try {
-        await this.player.setMediaSource(mediaSource);
-      } catch (e) {
-        this.api.onError(e);
-      }
+      await this.player.setMediaSource(mediaSource, NETWORK_PLAYBACK_STRATEGY);
     } else {
-      const sourceUri = videoSource.type === VideoSourceType.Network
-        ? videoSource.path
-        : this.toFileUri(videoSource.path);
+      const sourceUri = this.toFileUri(videoSource.path);
       if (sourceUri.startsWith(FD_PREFIX)) {
         this.player.fdSrc = {
           fd: Number.parseInt(sourceUri.substring(FD_PREFIX.length))
@@ -463,7 +506,75 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     }
   }
 
+  private canUseContinuousSeek(player: media.AVPlayer): boolean {
+    if (this.continuousSeekSupported == null) {
+      try {
+        this.continuousSeekSupported = player.isSeekContinuousSupported();
+      } catch (e) {
+        this.continuousSeekSupported = false;
+      }
+    }
+    return this.continuousSeekSupported === true;
+  }
+
+  private scheduleContinuousSeekFinish(): void {
+    this.cancelContinuousSeekTimer();
+    this.continuousSeekTimer = setTimeout(() => {
+      this.continuousSeekTimer = null;
+      this.finishContinuousSeek();
+    }, CONTINUOUS_SEEK_IDLE_TIMEOUT_MS);
+  }
+
+  private cancelContinuousSeekTimer(): void {
+    if (this.continuousSeekTimer == null) return;
+    clearTimeout(this.continuousSeekTimer);
+    this.continuousSeekTimer = null;
+  }
+
+  private finishContinuousSeek(): void {
+    if (!this.continuousSeekActive) return;
+
+    const player = this.player;
+    const requestedPosition = this.pendingSeekPosition;
+    this.continuousSeekActive = false;
+    this.cancelContinuousSeekTimer();
+
+    if (!player || !canSeek(player.state)) {
+      this.clearSeekState();
+      return;
+    }
+
+    try {
+      // SEEK_CONTINUOUS deliberately has no seekDone event. Ending the mode
+      // commits the last frame and lets us provide the same completion signal
+      // to the Flutter side.
+      player.seek(-1, media.SeekMode.SEEK_CONTINUOUS);
+    } catch (e) {
+      this.clearSeekState();
+      this.api.onError(e);
+      return;
+    }
+
+    this.isSeeking = false;
+    this.pendingSeekPosition = null;
+    let actualPosition = requestedPosition ?? 0;
+    try {
+      actualPosition = player.currentTime;
+    } catch (e) {
+    }
+    this.lastPosition = actualPosition;
+    this.api.onPlaybackPositionChanged(actualPosition);
+  }
+
+  private clearSeekState(): void {
+    this.isSeeking = false;
+    this.pendingSeekPosition = null;
+    this.continuousSeekActive = false;
+    this.cancelContinuousSeekTimer();
+  }
+
   private releasePlayer(): void {
+    this.clearSeekState();
     if (!this.player) {
       this.closeFileDescriptor();
       return;
@@ -474,6 +585,9 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     }
     if (this.onTimeUpdateHandler) {
       this.player.off('timeUpdate', this.onTimeUpdateHandler);
+    }
+    if (this.onSeekDoneHandler) {
+      this.player.off('seekDone', this.onSeekDoneHandler);
     }
     if (this.onErrorHandler) {
       this.player.off('error', this.onErrorHandler);
