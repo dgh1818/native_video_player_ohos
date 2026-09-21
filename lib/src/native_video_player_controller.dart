@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:native_video_player/src/platform_interface/native_video_player_api.dart';
 import 'package:native_video_player/src/playback_info.dart';
 import 'package:native_video_player/src/playback_status.dart';
@@ -12,6 +13,7 @@ class NativeVideoPlayerController with ChangeNotifier {
   late final NativeVideoPlayerApi _api;
   VideoSource? _videoSource;
   VideoInfo? _videoInfo;
+  bool _isDisposed = false;
 
   PlaybackStatus get _playbackStatus => onPlaybackStatusChanged.value;
 
@@ -88,9 +90,25 @@ class NativeVideoPlayerController with ChangeNotifier {
   }
 
   Future<void> _onPlaybackReady() async {
-    _videoInfo = await _api.getVideoInfo();
+    if (_isDisposed) {
+      return;
+    }
+    try {
+      _videoInfo = await _api.getVideoInfo();
+    } on MissingPluginException {
+      if (!_isDisposed) {
+        rethrow;
+      }
+      return;
+    }
+    if (_isDisposed) {
+      return;
+    }
     // Make sure the volume is reset to the correct value
     await setVolume(_volume);
+    if (_isDisposed) {
+      return;
+    }
     onPlaybackReady.notifyListeners();
   }
 
@@ -107,6 +125,10 @@ class NativeVideoPlayerController with ChangeNotifier {
   @override
   @protected
   void dispose() {
+    if (_isDisposed) {
+      return;
+    }
+    _isDisposed = true;
     unawaited(_api.disposePlayer());
     _api.detach();
     super.dispose();
@@ -116,8 +138,17 @@ class NativeVideoPlayerController with ChangeNotifier {
   ///
   /// NOTE: This method might throw an exception if the video source is invalid.
   Future<void> loadVideoSource(VideoSource videoSource) async {
+    if (_isDisposed) {
+      return;
+    }
     await stop();
-    await _api.loadVideoSource(videoSource);
+    if (_isDisposed) {
+      return;
+    }
+    await _runIfAlive(() => _api.loadVideoSource(videoSource));
+    if (_isDisposed) {
+      return;
+    }
     _videoSource = videoSource;
   }
 
@@ -125,7 +156,13 @@ class NativeVideoPlayerController with ChangeNotifier {
   ///
   /// NOTE: This method might throw an exception if the video cannot be played.
   Future<void> play() async {
-    await _api.play();
+    if (_isDisposed) {
+      return;
+    }
+    await _runIfAlive(_api.play);
+    if (_isDisposed) {
+      return;
+    }
     onPlaybackStatusChanged.value = PlaybackStatus.playing;
     await setPlaybackSpeed(_playbackSpeed);
   }
@@ -135,7 +172,13 @@ class NativeVideoPlayerController with ChangeNotifier {
   ///
   /// NOTE: This method might throw an exception if the video cannot be paused.
   Future<void> pause() async {
-    await _api.pause();
+    if (_isDisposed) {
+      return;
+    }
+    await _runIfAlive(_api.pause);
+    if (_isDisposed) {
+      return;
+    }
     onPlaybackStatusChanged.value = PlaybackStatus.paused;
   }
 
@@ -145,14 +188,28 @@ class NativeVideoPlayerController with ChangeNotifier {
   ///
   /// NOTE: This method might throw an exception if the video cannot be stopped.
   Future<void> stop() async {
-    await _api.stop();
+    if (_isDisposed) {
+      return;
+    }
+    await _runIfAlive(_api.stop);
+    if (_isDisposed) {
+      return;
+    }
     onPlaybackStatusChanged.value = PlaybackStatus.stopped;
   }
 
   /// Returns true if the video is playing, or false if it's stopped or paused.
   Future<bool> isPlaying() async {
+    if (_isDisposed) {
+      return false;
+    }
     try {
       return await _api.isPlaying() ?? false;
+    } on MissingPluginException {
+      if (_isDisposed) {
+        return false;
+      }
+      rethrow;
     } catch (exception) {
       return false;
     }
@@ -162,13 +219,22 @@ class NativeVideoPlayerController with ChangeNotifier {
   ///
   /// NOTE: This method might throw an exception if the video cannot be seeked.
   Future<void> seekTo(int milliseconds) async {
+    if (_isDisposed) {
+      return;
+    }
     var position = milliseconds;
     if (milliseconds < 0) position = 0;
     final duration = videoInfo?.duration ?? 0;
     if (milliseconds > duration) position = duration;
-    await _api.seekTo(position);
+    await _runIfAlive(() => _api.seekTo(position));
+    if (_isDisposed) {
+      return;
+    }
     // if the video is not playing, update onPlaybackPositionChanged
     if (_playbackStatus != PlaybackStatus.playing) {
+      if (_isDisposed) {
+        return;
+      }
       onPlaybackPositionChanged.value = position;
     }
   }
@@ -193,8 +259,14 @@ class NativeVideoPlayerController with ChangeNotifier {
   /// Sets the playback speed.
   /// The default value is 1.
   Future<void> setPlaybackSpeed(double speed) async {
+    if (_isDisposed) {
+      return;
+    }
     if (onPlaybackStatusChanged.value == PlaybackStatus.playing) {
-      await _api.setPlaybackSpeed(speed);
+      await _runIfAlive(() => _api.setPlaybackSpeed(speed));
+    }
+    if (_isDisposed) {
+      return;
     }
     _playbackSpeed = speed;
     onPlaybackSpeedChanged.value = speed;
@@ -204,14 +276,36 @@ class NativeVideoPlayerController with ChangeNotifier {
   ///
   /// NOTE: This method might throw an exception if the volume cannot be set.
   Future<void> setVolume(double volume) async {
-    await _api.setVolume(volume);
+    if (_isDisposed) {
+      return;
+    }
+    await _runIfAlive(() => _api.setVolume(volume));
+    if (_isDisposed) {
+      return;
+    }
     _volume = volume;
     onVolumeChanged.value = volume;
   }
 
   // ignore: avoid_positional_boolean_parameters
   Future<void> setLoop(bool loop) {
-    return _api.setLoop(loop);
+    if (_isDisposed) {
+      return Future<void>.value();
+    }
+    return _runIfAlive(() => _api.setLoop(loop));
+  }
+
+  Future<void> _runIfAlive(Future<void> Function() operation) async {
+    if (_isDisposed) {
+      return;
+    }
+    try {
+      await operation();
+    } on MissingPluginException {
+      if (!_isDisposed) {
+        rethrow;
+      }
+    }
   }
 
   // ignore: use_setters_to_change_properties

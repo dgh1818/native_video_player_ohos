@@ -12,7 +12,7 @@ export interface NativeVideoPlayerApiDelegate {
   pause(): void;
   stop(): void;
   isPlaying(): boolean;
-  seekTo(position: number): void;
+  seekTo(position: number): Promise<void>;
   setPlaybackSpeed(speed: number): void;
   setVolume(volume: number): void;
   setLoop(loop: boolean): void;
@@ -110,8 +110,12 @@ export class NativeVideoPlayerApi implements MethodCallHandler {
           result.error(INVALID_ARGUMENTS_ERROR_CODE, INVALID_ARGUMENTS_ERROR_MESSAGE, null);
           return;
         }
-        this.delegate?.seekTo(position);
-        result.success(null);
+        try {
+          await this.delegate?.seekTo(position);
+          result.success(null);
+        } catch (e) {
+          result.error('seek_failed', e instanceof Error ? e.message : String(e), null);
+        }
         return;
       }
       case 'setPlaybackSpeed': {

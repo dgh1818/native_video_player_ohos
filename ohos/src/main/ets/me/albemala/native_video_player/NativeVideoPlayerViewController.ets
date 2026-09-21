@@ -12,6 +12,7 @@ const FILE_PREFIX = 'file://';
 const FD_PREFIX = 'fd://';
 const SEEK_DONE_THRESHOLD_MS = 100;
 const CONTINUOUS_SEEK_IDLE_TIMEOUT_MS = 250;
+const SEEK_COMPLETION_TIMEOUT_MS = 5000;
 const NETWORK_PLAYBACK_STRATEGY: media.PlaybackStrategy = {
   // Keep enough data in memory for a stable progressive stream while the
   // separate start threshold below allows playback to begin quickly.
@@ -56,6 +57,16 @@ interface AVPlayerWithPlaybackRate extends media.AVPlayer {
   setPlaybackRate(rate: number): void;
 }
 
+interface PendingSeekCompletion {
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
+interface SeekPositionGuard {
+  start: number;
+  target: number;
+}
+
 export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDelegate {
   private api: NativeVideoPlayerApi;
   private player: media.AVPlayer | null = null;
@@ -69,8 +80,12 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
   private pendingSeekPosition: number | null = null;
   private continuousSeekActive: boolean = false;
   private continuousSeekTimer: number | null = null;
+  private seekCompletionTimer: number | null = null;
   private continuousSeekSupported: boolean | null = null;
   private fileDescriptor: number | null = null;
+  private pendingSeekCompletions: Array<PendingSeekCompletion> = [];
+  private seekPositionGuard: SeekPositionGuard | null = null;
+  private seekStartPosition: number | null = null;
 
   private onStateChangeHandler?: (state: media.AVPlayerState, reason: media.StateChangeReason) => Promise<void>;
   private onTimeUpdateHandler?: (time: number) => void;
@@ -187,17 +202,24 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     return this.player?.state === 'playing';
   }
 
-  seekTo(position: number): void {
+  seekTo(position: number): Promise<void> {
     const player = this.player;
-    if (!player || !canSeek(player.state)) return;
+    if (!player || !canSeek(player.state)) return Promise.resolve();
+
+    const completion = new Promise<void>((resolve, reject) => {
+      this.pendingSeekCompletions.push({ resolve, reject });
+    });
+
     this.isSeeking = true;
+    this.seekPositionGuard = null;
+    this.seekStartPosition = this.readCurrentPosition(player);
     this.pendingSeekPosition = position;
     if (this.canUseContinuousSeek(player)) {
       this.continuousSeekActive = true;
       this.scheduleContinuousSeekFinish();
       try {
         player.seek(position, media.SeekMode.SEEK_CONTINUOUS);
-        return;
+        return completion;
       } catch (e) {
         // Some codecs/devices report support but still reject the operation.
         // Fall back to the keyframe seek path instead of leaving the player
@@ -210,10 +232,14 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
 
     try {
       player.seek(position, media.SeekMode.SEEK_PREV_SYNC);
+      this.scheduleSeekCompletionTimeout();
     } catch (e) {
-      this.clearSeekState();
-      this.api.onError(e);
+      const error = this.toError(e);
+      this.clearSeekState(error);
+      this.api.onError(error);
     }
+
+    return completion;
   }
 
   setPlaybackSpeed(speed: number): void {
@@ -372,6 +398,10 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
         if (this.isSeeking) {
           return;
         }
+        if (this.seekPositionGuard != null && !this.isPositionPastSeekGuard(time)) {
+          return;
+        }
+        this.seekPositionGuard = null;
         if (this.lastPosition !== time) {
           this.lastPosition = time;
           this.api.onPlaybackPositionChanged(time);
@@ -391,24 +421,36 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
       // A previous seek may complete after a newer slider position was sent.
       // Re-issue the newest target and wait for its completion notification.
       if (Math.abs(requestedTime - pendingPosition) > SEEK_DONE_THRESHOLD_MS) {
-        this.safeRun(() => player.seek(pendingPosition, media.SeekMode.SEEK_PREV_SYNC));
+        try {
+          player.seek(pendingPosition, media.SeekMode.SEEK_PREV_SYNC);
+          this.scheduleSeekCompletionTimeout();
+        } catch (e) {
+          const error = this.toError(e);
+          this.clearSeekState(error);
+          this.api.onError(error);
+        }
         return;
       }
 
+      this.cancelSeekCompletionTimer();
       this.isSeeking = false;
       this.pendingSeekPosition = null;
-      let actualPosition = requestedTime;
-      try {
-        actualPosition = player.currentTime;
-      } catch (e) {
-      }
-      this.lastPosition = actualPosition;
-      this.api.onPlaybackPositionChanged(actualPosition);
+      // Report the requested position once. The Flutter controller also
+      // applies the requested value for paused playback; reporting a nearby
+      // keyframe first would make the progress bar visibly bounce.
+      this.seekPositionGuard = {
+        start: this.seekStartPosition ?? pendingPosition,
+        target: pendingPosition,
+      };
+      this.seekStartPosition = null;
+      this.lastPosition = pendingPosition;
+      this.api.onPlaybackPositionChanged(pendingPosition);
+      this.completePendingSeek();
       })
     );
 
     this.onErrorHandler = (error: BusinessError): void => {
-      this.clearSeekState();
+      this.clearSeekState(this.toError(error.message));
       this.api.onError(error.message);
     };
     this.player.on('error', this.onErrorHandler);
@@ -525,6 +567,66 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     }, CONTINUOUS_SEEK_IDLE_TIMEOUT_MS);
   }
 
+  private scheduleSeekCompletionTimeout(): void {
+    this.cancelSeekCompletionTimer();
+    this.seekCompletionTimer = setTimeout(() => {
+      this.seekCompletionTimer = null;
+      if (!this.isSeeking || this.continuousSeekActive) return;
+
+      const requestedPosition = this.pendingSeekPosition;
+      this.isSeeking = false;
+      this.pendingSeekPosition = null;
+      const reportedPosition = requestedPosition ?? 0;
+      this.seekPositionGuard = {
+        start: this.seekStartPosition ?? reportedPosition,
+        target: reportedPosition,
+      };
+      this.seekStartPosition = null;
+      this.lastPosition = reportedPosition;
+      this.api.onPlaybackPositionChanged(reportedPosition);
+      this.completePendingSeek();
+    }, SEEK_COMPLETION_TIMEOUT_MS);
+  }
+
+  private cancelSeekCompletionTimer(): void {
+    if (this.seekCompletionTimer == null) return;
+    clearTimeout(this.seekCompletionTimer);
+    this.seekCompletionTimer = null;
+  }
+
+  private completePendingSeek(error?: Error): void {
+    const completions = this.pendingSeekCompletions;
+    this.pendingSeekCompletions = [];
+    completions.forEach((completion: PendingSeekCompletion) => {
+      if (error) {
+        completion.reject(error);
+      } else {
+        completion.resolve();
+      }
+    });
+  }
+
+  private toError(error: Error | string): Error {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+
+  private readCurrentPosition(player: media.AVPlayer): number {
+    try {
+      return player.currentTime;
+    } catch (e) {
+      return this.lastPosition >= 0 ? this.lastPosition : 0;
+    }
+  }
+
+  private isPositionPastSeekGuard(time: number): boolean {
+    const guard = this.seekPositionGuard;
+    if (guard == null) return true;
+    if (guard.target >= guard.start) {
+      return time + SEEK_DONE_THRESHOLD_MS >= guard.target;
+    }
+    return time - SEEK_DONE_THRESHOLD_MS <= guard.target;
+  }
+
   private cancelContinuousSeekTimer(): void {
     if (this.continuousSeekTimer == null) return;
     clearTimeout(this.continuousSeekTimer);
@@ -557,20 +659,30 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
 
     this.isSeeking = false;
     this.pendingSeekPosition = null;
-    let actualPosition = requestedPosition ?? 0;
-    try {
-      actualPosition = player.currentTime;
-    } catch (e) {
-    }
-    this.lastPosition = actualPosition;
-    this.api.onPlaybackPositionChanged(actualPosition);
+    const reportedPosition = requestedPosition ?? 0;
+    // The player can still deliver timeUpdate events queued before the
+    // continuous seek finished. Ignore those until the stream reaches the
+    // requested position, otherwise Flutter briefly jumps back to the old
+    // playback position after a successful seek.
+    this.seekPositionGuard = {
+      start: this.seekStartPosition ?? reportedPosition,
+      target: reportedPosition,
+    };
+    this.seekStartPosition = null;
+    this.lastPosition = reportedPosition;
+    this.api.onPlaybackPositionChanged(reportedPosition);
+    this.completePendingSeek();
   }
 
-  private clearSeekState(): void {
+  private clearSeekState(error?: Error): void {
     this.isSeeking = false;
     this.pendingSeekPosition = null;
     this.continuousSeekActive = false;
+    this.seekPositionGuard = null;
+    this.seekStartPosition = null;
     this.cancelContinuousSeekTimer();
+    this.cancelSeekCompletionTimer();
+    this.completePendingSeek(error);
   }
 
   private releasePlayer(): void {
