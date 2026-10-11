@@ -231,7 +231,8 @@ class NativeVideoPlayerController with ChangeNotifier {
       return;
     }
     // if the video is not playing, update onPlaybackPositionChanged
-    if (_playbackStatus != PlaybackStatus.playing) {
+    if (_playbackStatus != PlaybackStatus.playing &&
+        defaultTargetPlatform != TargetPlatform.ohos) {
       if (_isDisposed) {
         return;
       }
