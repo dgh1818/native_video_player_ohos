@@ -2,11 +2,13 @@ import { BinaryMessenger } from '@ohos/flutter_ohos/src/main/ets/plugin/common/B
 import { SurfaceTextureEntry } from '@ohos/flutter_ohos/src/main/ets/view/TextureRegistry';
 import media from '@ohos.multimedia.media';
 import fs from '@ohos.file.fs';
+import deviceInfo from '@ohos.deviceInfo';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { NativeVideoPlayerApi, NativeVideoPlayerApiDelegate } from './NativeVideoPlayerApi';
 import { VideoSource } from './VideoSource';
 import { VideoSourceType } from './VideoSourceType';
 import { VideoInfo } from './VideoInfo';
+import { HttpMediaSourceLoader } from './HttpMediaSourceLoader';
 
 const FILE_PREFIX = 'file://';
 const FD_PREFIX = 'fd://';
@@ -74,6 +76,8 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
   private readonly surfaceId: string;
   private readonly onReleaseRequested: (textureId: number) => void;
   private pendingSource: VideoSource | null = null;
+  private mediaSource: media.MediaSource | null = null;
+  private sourceLoader: HttpMediaSourceLoader | null = null;
   private lastPosition: number = -1;
   private loop: boolean = false;
   private isSeeking: boolean = false;
@@ -120,7 +124,8 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
   async loadVideoSource(videoSource: VideoSource): Promise<void> {
     this.pendingSource = videoSource;
     this.clearSeekState();
-    this.continuousSeekSupported = null;
+    // Network sources need a normal seek with seekDone, not drag-preview mode.
+    this.continuousSeekSupported = videoSource.type === VideoSourceType.Network ? false : null;
     this.lastPosition = -1;
     if (!this.player) {
       return;
@@ -206,6 +211,7 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
   seekTo(position: number): Promise<void> {
     const player = this.player;
     if (!player || !canSeek(player.state)) return Promise.resolve();
+    console.info(`NativeVideoPlayer seekTo textureId=${this.textureId} target=${position} state=${player.state}`);
 
     const completion = new Promise<void>((resolve, reject) => {
       this.pendingSeekCompletions.push({ resolve, reject });
@@ -215,6 +221,7 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
       // Coalesce requests until the current seekDone; only the latest target
       // needs a second decoder seek.
       this.pendingSeekPosition = position;
+      if (this.seekCompletionTimer == null) this.scheduleSeekCompletionTimeout();
       return completion;
     }
 
@@ -450,6 +457,7 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
       // SEEK_PREV_SYNC can land on an earlier keyframe, so use currentTime to
       // let playback position updates resume immediately after the seek.
       const actualPosition = this.readCurrentPosition(player);
+      console.info(`NativeVideoPlayer seekDone textureId=${this.textureId} requested=${_seekDoneTime} actual=${actualPosition}`);
       this.seekPositionGuard = {
         start: this.seekStartPosition ?? actualPosition,
         target: actualPosition,
@@ -515,12 +523,26 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
   private async applyVideoSource(videoSource: VideoSource): Promise<void> {
     if (!this.player) return;
 
+    this.sourceLoader?.dispose();
+    this.sourceLoader = null;
+    this.mediaSource = null;
     this.closeFileDescriptor();
     if (videoSource.type === VideoSourceType.Network) {
+      const transport = videoSource.headers['X-Immich-Seek-Transport'];
+      const headers: Record<string, string> = {};
+      Object.keys(videoSource.headers).forEach((key: string) => {
+        if (key !== 'X-Immich-Seek-Transport') headers[key] = videoSource.headers[key];
+      });
       const mediaSource = media.createMediaSourceWithUrl(
         videoSource.path,
-        videoSource.headers
+        headers
       );
+      this.mediaSource = mediaSource; // Its native destructor clears loader callbacks.
+      if (transport === 'http1' && deviceInfo.sdkApiVersion >= 26) {
+        this.sourceLoader = new HttpMediaSourceLoader();
+        mediaSource.setMediaResourceLoaderDelegate(this.sourceLoader);
+        console.info(`NativeVideoPlayer transport=http1 textureId=${this.textureId}`);
+      }
       await this.player.setMediaSource(mediaSource, NETWORK_PLAYBACK_STRATEGY);
     } else {
       const sourceUri = this.toFileUri(videoSource.path);
@@ -592,15 +614,9 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
         `Seek to ${requestedPosition ?? 'unknown'}ms timed out at ${actualPosition}ms`
       );
 
-      // A timeout is not proof that the requested seek succeeded. Clear the
-      // stale-position guard and report the player's actual position so later
-      // timeUpdate events can recover instead of leaving Flutter pinned to a
-      // position the decoder never reached.
-      this.clearSeekState(error);
-      if (player && actualPosition >= 0) {
-        this.lastPosition = actualPosition;
-        this.api.onPlaybackPositionChanged(actualPosition);
-      }
+      // The native seek is still running. Keep its latest queued target until
+      // seekDone; clearing it here loses the last tap and allows overlapping seeks.
+      this.completePendingSeek(error);
     }, SEEK_COMPLETION_TIMEOUT_MS);
   }
 
@@ -640,7 +656,8 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     if (guard.target >= guard.start) {
       return time + SEEK_DONE_THRESHOLD_MS >= guard.target;
     }
-    return time - SEEK_DONE_THRESHOLD_MS <= guard.target;
+    // Backward playback can pass target + 100ms before its first timeUpdate.
+    return true;
   }
 
   private cancelContinuousSeekTimer(): void {
@@ -701,7 +718,10 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
 
   private releasePlayer(): void {
     this.clearSeekState();
+    this.sourceLoader?.dispose();
+    this.sourceLoader = null;
     if (!this.player) {
+      this.mediaSource = null;
       this.closeFileDescriptor();
       return;
     }
@@ -720,11 +740,15 @@ export class NativeVideoPlayerViewController implements NativeVideoPlayerApiDele
     }
 
     const player = this.player;
+    const mediaSource = this.mediaSource;
     this.player = null;
     this.safeRunVoid(
       () => player.release(),
       undefined,
-      () => this.closeFileDescriptor()
+      () => {
+        if (this.mediaSource === mediaSource) this.mediaSource = null;
+        this.closeFileDescriptor();
+      }
     );
     this.closeFileDescriptor();
   }
